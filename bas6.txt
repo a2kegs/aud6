@@ -1,0 +1,16 @@
+
+ 10 D$ =  CHR$ (4)
+ 15 F$ = "AUD6"
+ 20  PRINT D$;"BLOAD ";F$
+ 30 ADR = 32768
+ 35  INPUT "Value to repeat, -1 load SNDDATA:";A
+ 40  IF A < 0 THEN  PRINT D$;"BLOAD SNDDATA,A$1000,L$7000": GOTO 110
+ 60  POKE 0,A
+ 70  POKE 1,0: POKE 2,16
+ 80  CALL ADR + 3
+ 110  REM
+ 120  INPUT "Press Return to start:";A$
+ 130 ADR = 32768
+ 135  POKE 2,16
+ 140  CALL ADR
+

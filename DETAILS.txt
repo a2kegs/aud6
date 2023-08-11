@@ -1,0 +1,134 @@
+
+How AUD6 works:
+
+Place sound data from $0800 through $7fff.  There must be data in every
+location, just place '0's padding until the end.
+
+AUD6 loads at $8000 and has two entry points: $8000 plays from the
+address in $01,$02 until $7fff, but clears $01 to 0.  So set $02 to the
+starting page.  $10 (for $1000) is a good idea if you want a small Basic
+program to control it.  The second entry point is $8003,
+and it will store the value in ZP location $00 to ($01) until $7fff.
+I use this to test whether each sample works.  Set ZP $00 to #$80, call
+$8003, then call $8000, and it should be "silence", but a waveform of the
+speaker 32 cycle "hi" and 33 cycles "lo".  I hear a slight whine, which
+is about what I would expect.
+
+The data needs to be 8-bit audio in unsigned 8-bit notation: $00 is the
+lowest value, and $ff is the highest, but the low 2 bits are ignored.
+In this way, IIgs sound data can just be directly played.  Except the
+sample rate is fixed at 15.7KHz (65 1MHz cycles per sample).
+
+BAS6 is a simple program to load snddata at $0800 and then call $8000.
+
+Why 65 cycles?  The Apple II clock generator stretches the 1MHz clock
+every 65th clock (and makes that cycle 14% longer).  This is a small effect
+that can generally be ignored, but it slightly change the pitch of certain
+sounds, by making sounds around 400Hz vary by about 1Hz (a warble of sorts).
+It's unclear if this is audible (it basically adds a subtle overtone, which
+often is a pleasing effect) so I don't think it's a big deal.
+
+By making the sample period 65 cycles, this effect no longer
+affects pitch for AUD6 (it does slightly affect volume).  I first used
+64 cycle, and moved to 65 because it seemed easy to just take care of
+this effect.
+
+Theory of operation:
+-------------------
+
+AUD6.s enables the speaker to play all 66 possible values of the speaker
+being high for N cycles and low for 66-N cycles.  The basic code flow is:
+
+nextsamp" reads the sample from (zp1),y, masks it with #$fc, and stores
+the result into a the low destination address byte of future "JMP table"
+instruction.  The table contains 64 "JMP sampleN; NOP" entries.  Each
+"sampleN" entry toggles the $C030 speaker so that it is high for N cycles,
+and low for the remaining time.
+
+I think there are 3 newish ideas in this code.  Well, someone somewhere
+has probably done both before, but I looked at existing Apple II PWM and
+delta modulation code, and no one was using these yet:
+
+	1. A sequence of "LDA #$A9" instructions giving an easy delay of 2-50
+		cycles with 1 cycle resolution.
+	2. Counting the first 6 clocks of each "sample routine" as really
+		being part of the previous sample, giving it preparation time
+	3. Tracking the speaker state as "hi" or "lo" to enable driving
+		a sample of 65 followed by 0 which is otherwise not possible.
+
+1) A simple way to get a delay from 2 to N cycles using N bytes.  Each sampleN
+	routine must take a total of 65 cycles.  The overhead of
+	getting the sample, and jumping to sampleN is currently 28 cycles.
+	So sample0, which would do nothing, needs to waste 37 cycles.
+	So what it does it jump to "nextsamp + 1 - delay", where delay is
+	the number of cycles.  Here's the code before nextsamp:
+
+		LDA	#$A9
+		LDA	#$A9
+		...			
+		LDA	#$A9
+		LDA	#$A9
+		LDA	$EA	; This is $A5, $EA
+	nextsamp:
+		lda	(zp1,y)
+
+	If we jump to nextsamp-1, that takes 2 cycles (there's an $EA instr
+	there which is a NOP, which takes 2 cycles).  If we jump to
+	nextsamp-2, that takes 3 cycles (LDA zp takes 3 clocks, it reads
+	address $EA which we just ignore).  If we jump to nextsamp-3,
+	we will execute: "$a9, $a5, $ea" which is "LDA #$a5, NOP" which takes
+	4 cycles.  If we jump to nextsamp-4, this is "LDA #$a9, LDA $EA"
+	which takes 5 cycles.  And jumping to nextsamp-5 is "$a9, $a9, $a9,
+	$a5, $ea) which is "LDA #$a9, LDA #$a5, NOP" which takes 6 cycles.
+	
+	So we cannot delay 1 extra cycle, but we can do any delay from
+	2 through 40 (which is all the code needs) using just 40 bytes
+	of these LDA #$A9 instructions.  This gets rid of a bunch of code
+	in the sampleN routines which would have been needed to waste time.
+
+2) The sampleN routines are called at time 65-6 into the previous sample.
+	This naming trick lets the code prepare to toggle the $C030 speaker
+	by borrowing time from the previous sample.
+	So if the speaker is low, and Sample65 is called, it can do:
+
+		NOP			; 2 cycles
+		STA	$C030		; 4 cycles
+
+	And toggle the speaker immediately at the beginning of its 65
+	cycle period.  Then it does nothing else, so it jumps to
+	nextsamp+1-28.  But the real interesting case is samp64, which
+	needs to drive the speaker high for 64 out of 65 clocks:
+
+		STX	zp4		; 3 cycles
+		STA	$C030		; 4 cycles
+		JMP nextsamp + 1 - 27
+
+	By using our 6 cycles of the previous sample, we can easily delay
+	one extra clock, a total of 7 for sample64, before toggling the
+	speaker.
+
+3) Even with this, it's not possible to drive sample==65 followed by
+	sample==0, as well as drive sample==65 followed by sample==65.
+	To get these cases right, the code tracks the current speaker
+	state as "hi" or "lo", and calls the nextsamp routine with the
+	state in the name.  Now it's possible to do all combinations of
+	SampleN followed by SampleM.  The sampleN routine calls nextsamplo
+	if it leaves the speaker low, and nextsamphi if it leaves the speaker
+	hi.  So Sample65 always calls nextsamphi (it must, the speaker must
+	be high at its end), and Sample0 always calls nextsamplo (for
+	similar reasons).  Other samples get to choose where they leave
+	the speaker high or low.  For sampN, where N is small, it makes
+	sense for the routine to ensure the speaker is high at the start,
+	do a delay of N cycles, toggle the speaker low and call nextsamplo.
+	Similarly, for N large, do the reverse and leave the speaker high
+	at the end and call nextsamphi.
+
+	The tricky part is the samples in the middle, like samp32.  The
+	general overhead is more than 34 clocks, so it cannot just toggle
+	the speaker to be high for 32 clocks and call nextsamplo, since the
+	delay until the next sample would then be more than 65 totall clocks.
+	So, it has to pull in some of the code from nextsamp* into the sampNlo
+	and sampNhi routines and then call a shortened dispatch version,
+	called nextsamplo2 (and nextsamphi2) which has 13 less cycles of
+	overhead.
+
